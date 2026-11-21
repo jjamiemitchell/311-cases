@@ -6,50 +6,33 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(forcats)
 ```
 
-## R Markdown
+## Step 0: Load and Clean Data
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-## Install the required package with:
-
-# CSV endpoint; $limit controls rows (default is only 1000)
-url <- "https://data.sf.gov/resource/5cei-gny5.csv?$limit=50000"
-evictions <- read.csv(url)
-str(evictions)
-
-install.packages("RSocrata")
-
-
-library(jsonlite)
-
-url <- "https://data.sfgov.org/resource/vw6y-z8j6.json?$limit=50000"
+```{r load-data}
+# 311 cases only. (The evictions dataset and install.packages() were removed:
+# install.packages() should be run once in the console, not inside a knitted file.)
+url <- "https://data.sfgov.org/resource/vw6y-z8j6.json?$limit=5000"
 
 df <- fromJSON(url)
 
-View(df)
-
+# View(df)   # keep View() out of the knitted file, run it in the console instead
+names(df)
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
-
-```{r}
-library(dplyr)
-
+```{r hours-to-close}
+# Hours to close
 cases <- df %>%
+  # nested columns (e.g. "point") come in as data frames and break later steps
+  select(-where(is.data.frame)) %>%
   mutate(
     opened = as.POSIXct(requested_datetime,
                         format = "%Y-%m-%dT%H:%M:%OS"),
@@ -57,27 +40,22 @@ cases <- df %>%
                         format = "%Y-%m-%dT%H:%M:%OS"),
     hours_to_close = as.numeric(
       difftime(closed, opened, units = "hours")
-    )
+    ),
+    lat  = as.numeric(lat),    # JSON delivers these as text
+    long = as.numeric(long)
   )
 
 summary(cases$hours_to_close)
 ```
 
-
-```{r}
+```{r cleaning}
 # DATA CLEANING: Remove invalid closure times
-
 # We found 9 cases with negative closure times (closed before opened).
 # Remove these observations because closure time cannot be negative.
 # Also remove cases with missing closure times.
 # Keep the original dataset unchanged by creating a cleaned dataset.
-# DESCRIPTIVE STATISTICS: Outcome variable (Y)
-# Calculate the mean, median, standard deviation,
-# minimum, maximum, and quartiles of closure time.
 
-summary(cases_clean$hours_to_close)
-
-sd(cases_clean$hours_to_close, na.rm = TRUE)
+# (cases_clean must be created BEFORE we compute anything on it)
 cases_clean <- cases[
   !is.na(cases$hours_to_close) &
   cases$hours_to_close >= 0,
@@ -89,58 +67,345 @@ sum(cases_clean$hours_to_close < 0)
 # Check the number of observations remaining after cleaning
 nrow(cases_clean)
 
+# DESCRIPTIVE STATISTICS: Outcome variable (Y)
+# Calculate the mean, median, standard deviation,
+# minimum, maximum, and quartiles of closure time.
 
+summary(cases_clean$hours_to_close)
+sd(cases_clean$hours_to_close, na.rm = TRUE)
+
+# Date range of the data (tells us whether season is usable, and whether
+# we are looking at one year or several)
+range(cases_clean$opened)
 ```
 
-```{r}
+```{r minutes}
+# Use minutes to close a request as output instead?
+# Minutes vs hours is only a change of units (x60). It does not change the
+# shape of the distribution, the model fit, or which predictors matter.
+# It only changes how coefficients are read ("minutes" vs "hours").
+# Minutes are only useful if a large share of cases close within an hour.
 
-# BOXPLOT: 311 Case Closure Times by Neighborhood
-# Compare closure times across San Francisco neighborhoods.
-# Hide outlier points and zoom in on the central 95% of closure times.
-# Order neighborhoods by median closure time.
+cases_clean <- cases_clean %>%
+  mutate(
+    minutes_to_close = hours_to_close * 60,
+    log_hours = log1p(hours_to_close)    # log(1 + hours): handles zeros, tames skew
+  )
 
-# Remove observations with missing neighborhood names
-plot_data <- subset(cases_clean, !is.na(analysis_neighborhood))
-
-# Calculate median closure time for each neighborhood
-medians <- tapply(
-  plot_data$hours_to_close,
-  plot_data$analysis_neighborhood,
-  median
-)
-
-# Order neighborhoods by median closure time
-plot_data$analysis_neighborhood <- factor(
-  plot_data$analysis_neighborhood,
-  levels = names(sort(medians))
-)
-
-# Calculate the 95th percentile for a cleaner display
-upper_limit <- quantile(
-  plot_data$hours_to_close,
-  0.95,
-  na.rm = TRUE
-)
-
-# Increase left margin to fit neighborhood names
-par(mar = c(5, 15, 4, 2))
-
-# Create horizontal boxplot
-boxplot(
-  hours_to_close ~ analysis_neighborhood,
-  data = plot_data,
-  horizontal = TRUE,
-  outline = FALSE,
-  ylim = c(0, upper_limit),
-  col = "lightblue",
-  border = "steelblue",
-  las = 1,
-  cex.axis = 0.7,
-  main = "311 Case Closure Times by Neighborhood",
-  xlab = "Hours to Close",
-  ylab = ""
-)
-
+mean(cases_clean$hours_to_close < 1)     # share closed in under 1 hour
+mean(cases_clean$hours_to_close < 24)    # share closed in under 1 day
+quantile(cases_clean$hours_to_close, c(.05, .25, .5, .75, .9, .95, .99))
 ```
 
+#### Missing Values
+
+```{r missing}
+is_missing <- function(x) {
+  if (is.character(x)) is.na(x) | x == "" else is.na(x)
+}
+
+cases_model <- cases_clean %>%
+  select(any_of(c(
+    "hours_to_close", "log_hours", "opened",
+    "agency_responsible", "agency_c",
+    "service_name", "service_subtype",
+    "analysis_neighborhood", "neighborhood_c",
+    "police_district", "supervisor_district",
+    "source", "lat", "long"
+  )))
+
+# Which columns actually made it into cases_model?
+names(cases_model)
+
+# Missing values per column
+missing_model <- data.frame(
+  variable    = names(cases_model),
+  type        = sapply(cases_model, function(x) class(x)[1]),
+  n_missing   = sapply(cases_model, function(x) sum(is_missing(x))),
+  pct_missing = round(100 * sapply(cases_model, function(x) mean(is_missing(x))), 1),
+  n_unique    = sapply(cases_model, n_distinct),
+  row.names   = NULL
+) %>%
+  arrange(desc(n_missing))
+
+missing_model
+
+# How many rows survive if we drop every row with any missing value?
+nrow(cases_model)
+nrow(na.omit(cases_model))
+```
+
+###
+
+```{r categorical}
+# Categorical variables in cases_model: how many levels, which levels,
+# and which are too sparse to estimate in a regression.
+
+# Treat blank strings as missing so they are visible in the counts
+cases_model <- cases_model %>%
+  mutate(across(where(is.character), ~ na_if(.x, "")))
+
+is_cat <- function(x) is.character(x) || is.factor(x)
+
+# 1. How many distinct values does each categorical column have?
+cat_summary <- cases_model %>%
+  select(where(is_cat)) %>%
+  summarise(across(everything(), ~ n_distinct(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_unique") %>%
+  arrange(n_unique)
+cat_summary
+
+# 2. For columns with a manageable number of levels, list levels and counts
+small_cats <- cat_summary %>% filter(n_unique <= 30) %>% pull(variable)
+
+for (v in small_cats) {
+  cat("\n====", v, "====\n")
+  print(sort(table(cases_model[[v]], useNA = "ifany"), decreasing = TRUE))
+}
+
+# 3. Sparse levels (fewer than 10 cases) and dummy-column cost per variable
+sparse_check <- lapply(cat_summary$variable, function(v) {
+  tab <- table(cases_model[[v]])
+  data.frame(
+    variable        = v,
+    n_levels        = length(tab),
+    dummy_columns   = length(tab) - 1,          # k - 1 parameters in a regression
+    levels_under_10 = sum(tab < 10),
+    pct_in_top5     = round(100 * sum(sort(tab, decreasing = TRUE)[1:min(5, length(tab))]) / sum(tab), 1)
+  )
+}) %>%
+  bind_rows() %>%
+  arrange(desc(dummy_columns))
+sparse_check
+```
+
+
+
+```{r collapse-example}
+# Keep levels with at least 20 cases, lump the rest into "Other"
+cases_clean <- cases_clean %>%
+  mutate(
+    neighborhood_c = fct_lump_min(factor(analysis_neighborhood), min = 20,
+                                  other_level = "Other"),
+    agency_c       = fct_lump_min(factor(agency_responsible), min = 20,
+                                  other_level = "Other")
+  )
+table(cases_clean$neighborhood_c)
+table(cases_clean$agency_c)
+```
+
+## Plots
+
+```{r outcome-plots, echo=FALSE}
+# Outcome variable: show me hours
+par(mfrow = c(1, 2))
+hist(cases_clean$hours_to_close, breaks = 50, col = "steelblue", border = "white",
+     main = "Hours to close (raw)", xlab = "Hours")
+hist(cases_clean$log_hours, breaks = 40, col = "steelblue", border = "white",
+     main = "log(1 + hours)", xlab = "log(1 + hours)")
+par(mfrow = c(1, 1))
+
+# Zoomed view of the raw scale: first 7 days only
+cases_clean %>%
+  filter(hours_to_close <= 24 * 7) %>%
+  ggplot(aes(hours_to_close)) +
+  geom_histogram(binwidth = 6, fill = "steelblue", color = "white") +
+  labs(x = "Hours to close (cases closed within 7 days)", y = "Cases")
+```
+
+## Plots
+
+```{r plot-setup, include=FALSE}
+# Run this chunk first: shared theme, axis labels, and the plotting data.
+# Uses cases_model (needs: opened, hours_to_close, log_hours, police_district,
+# analysis_neighborhood, lat, long). Swap in cases_clean if any are missing.
+
+library(scales)
+
+# hours + 1 lets us use a log axis even when a case closes in 0 hours
+plot_df <- cases_model %>% mutate(h1 = hours_to_close + 1)
+
+# Readable axis: ticks in hours / days / weeks instead of log numbers
+hrs_at     <- c(0, 1, 6, 24, 72, 168, 720)
+hrs_labels <- c("0", "1 hr", "6 hrs", "1 day", "3 days", "1 week", "1 month")
+x_hours <- scale_x_log10(breaks = hrs_at + 1, labels = hrs_labels)
+y_hours <- scale_y_log10(breaks = hrs_at + 1, labels = hrs_labels)
+
+theme_311 <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title.position = "plot",
+    plot.title      = element_text(face = "bold", size = 15),
+    plot.subtitle   = element_text(color = "grey35"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "bottom",
+    strip.text      = element_text(face = "bold")
+  )
+theme_set(theme_311)
+
+col_main <- "#2C7FB8"
+```
+
+### Outcome distribution
+
+```{r outcome-plots, fig.width=8, fig.height=4.5}
+share_1h  <- mean(plot_df$hours_to_close < 1)
+share_24h <- mean(plot_df$hours_to_close < 24)
+med_h     <- median(plot_df$hours_to_close)
+
+ggplot(plot_df, aes(h1)) +
+  geom_histogram(bins = 45, fill = col_main, color = "white", linewidth = .2) +
+  geom_vline(xintercept = med_h + 1, linetype = "dashed", color = "grey25") +
+  annotate("text", x = med_h + 1, y = Inf, vjust = 1.8, hjust = -0.1, size = 3.8,
+           label = paste0("Median: ", round(med_h, 1), " hrs")) +
+  x_hours +
+  labs(title = "Most 311 cases close within a day or two",
+       subtitle = paste0(percent(share_1h, .1), " close within 1 hour; ",
+                         percent(share_24h, .1), " within 24 hours"),
+       x = "Time to close (log scale)", y = "Number of cases")
+```
+
+### Time series
+
+```{r time-series, fig.width=10, fig.height=7}
+# Monthly median closure time per police district, one panel per district.
+# The grey line is the citywide median so each district can be compared to it.
+# Months with fewer than 5 cases are dropped (too noisy).
+
+ts_district <- plot_df %>%
+  filter(!is.na(police_district)) %>%
+  mutate(open_month = floor_date(opened, "month")) %>%
+  group_by(open_month, police_district) %>%
+  summarise(med = median(h1), n = n(), .groups = "drop") %>%
+  filter(n >= 5)
+
+ts_city <- plot_df %>%
+  mutate(open_month = floor_date(opened, "month")) %>%
+  group_by(open_month) %>%
+  summarise(med = median(h1), .groups = "drop")
+
+ggplot(ts_district, aes(open_month, med)) +
+  geom_line(data = ts_city, color = "grey70", linewidth = 1) +
+  geom_line(color = col_main, linewidth = .9) +
+  geom_point(aes(size = n), color = col_main, alpha = .7) +
+  facet_wrap(~ police_district) +
+  y_hours +
+  scale_size_continuous(range = c(1, 4)) +
+  labs(title = "Median closure time over time, by police district",
+       subtitle = "Blue: district median. Grey: citywide median. Point size = cases that month.",
+       x = NULL, y = "Median time to close", size = "Cases")
+```
+
+```{r weekly-volume, fig.width=9, fig.height=3.5}
+plot_df %>%
+  count(week = floor_date(opened, "week")) %>%
+  ggplot(aes(week, n)) +
+  geom_area(fill = col_main, alpha = .25) +
+  geom_line(color = col_main, linewidth = .9) +
+  labs(title = "Weekly case volume", x = NULL, y = "Cases opened")
+```
+
+```{r censoring-check, fig.width=9, fig.height=4}
+# Do closure times fall at the end of the range? (open cases were dropped,
+# so recent cases only appear if they closed quickly)
+plot_df %>%
+  group_by(open_month = floor_date(opened, "month")) %>%
+  summarise(Median = median(h1),
+            `90th percentile` = quantile(h1, .9),
+            n = n(), .groups = "drop") %>%
+  filter(n >= 5) %>%
+  pivot_longer(c(Median, `90th percentile`)) %>%
+  ggplot(aes(open_month, value, color = name)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  y_hours +
+  scale_color_manual(values = c(Median = col_main, `90th percentile` = "#D95F0E")) +
+  labs(title = "Censoring check: does closure time drop in the latest months?",
+       subtitle = "A sharp fall at the right edge means recent slow cases are still open (and missing)",
+       x = "Month opened", y = "Time to close", color = NULL)
+```
+
+### Map
+
+```{r map, fig.width=7, fig.height=7}
+geo <- plot_df %>%
+  filter(!is.na(lat), !is.na(long), lat != 0, long != 0) %>%
+  arrange(h1)   # draw the slowest cases last so they stay visible
+
+ggplot(geo, aes(long, lat, color = h1)) +
+  geom_point(alpha = .75, size = 1.8) +
+  scale_color_viridis_c(option = "plasma", direction = -1, trans = "log10",
+                        breaks = hrs_at[-1] + 1, labels = hrs_labels[-1],
+                        name = "Time to close") +
+  coord_quickmap() +
+  labs(title = "Where are the slow cases?",
+       subtitle = "Each point is one closed 311 case") +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey35"),
+        legend.position = "bottom",
+        legend.key.width = unit(1.6, "cm"))
+```
+
+```{r map-district, fig.width=7, fig.height=7}
+geo %>% filter(!is.na(police_district)) %>%
+  ggplot(aes(long, lat, color = police_district)) +
+  geom_point(alpha = .8, size = 1.8) +
+  scale_color_viridis_d(option = "turbo", name = NULL) +
+  coord_quickmap() +
+  guides(color = guide_legend(nrow = 2, override.aes = list(size = 3, alpha = 1))) +
+  labs(title = "Cases by police district") +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        legend.position = "bottom")
+```
+
+### Closure time by group (one reusable function)
+
+```{r box-fn}
+# Horizontal boxplots ordered by median, box color = group median,
+# n in each label, dashed line = overall median, groups with < min_n cases hidden.
+box_by <- function(data, var, min_n = 10, top_n = 20, title = NULL) {
+  d <- data %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(grp = as.character(.data[[var]])) %>%
+    mutate(n = n()) %>%
+    ungroup() %>%
+    filter(n >= min_n)
+
+  keep <- d %>% count(grp, sort = TRUE) %>% slice_head(n = top_n) %>% pull(grp)
+
+  d <- d %>%
+    filter(grp %in% keep) %>%
+    mutate(lab = paste0(stringr::str_trunc(grp, 35), "  (n=", n, ")"),
+           lab = fct_reorder(lab, h1, median)) %>%
+    group_by(lab) %>% mutate(med = median(h1)) %>% ungroup()
+
+  ggplot(d, aes(h1, lab, fill = med)) +
+    geom_boxplot(outlier.size = .8, outlier.alpha = .3, linewidth = .4, alpha = .9) +
+    geom_vline(xintercept = median(d$h1), linetype = "dashed", color = "grey30") +
+    scale_x_log10(breaks = hrs_at + 1, labels = hrs_labels) +
+    scale_fill_viridis_c(option = "mako", direction = -1, trans = "log10", guide = "none") +
+    labs(title = title,
+         subtitle = paste0("Groups with at least ", min_n,
+                           " cases. Dashed line = overall median."),
+         x = "Time to close (log scale)", y = NULL)
+}
+```
+
+```{r box-neighborhood, fig.width=9, fig.height=8}
+box_by(plot_df, "analysis_neighborhood", min_n = 10, top_n = 25,
+       title = "Closure time by neighborhood")
+```
+### Responsible Agency 
+	
+The agency responsible for fulfilling or otherwise addressing the service request.
+```{r box-district, fig.width=9, fig.height=5}
+box_by(plot_df, "police_district",
+       title = "Closure time by police district")
+```
+
+```{r box-agency, fig.width=9, fig.height=5}
+# Same function works for any categorical variable, e.g.:
+box_by(plot_df, "agency_responsible", title = "Closure time by agency")
+```
 
