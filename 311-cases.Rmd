@@ -142,5 +142,24 @@ boxplot(
 )
 
 ```
+```{r } 
+# Create a scatterplot showing 311 case closure times across all years
+ggplot(cases_clean, aes(x = year, y = hours_to_close)) +
 
+  # Add blue dots representing individual 311 cases
+  geom_point(alpha = 0.2, color = "steelblue") +
+
+  # Add a red linear regression line to show the overall trend
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+
+  # Add the title and axis labels
+  labs(
+    title = "311 Case Closure Time Over Time",
+    x = "Year",
+    y = "Hours to Close"
+  ) +
+
+  # Apply a clean graph theme
+  theme_minimal()
+```{r}
 
